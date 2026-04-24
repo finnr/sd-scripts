@@ -424,7 +424,7 @@ def sample_images(
     dit.switch_block_swap_for_inference()
 
     prompts = train_util.load_prompts(args.sample_prompts)
-    save_dir = os.path.join(args.output_dir, "sample")
+    save_dir = train_util.get_sample_output_dir(args)
     os.makedirs(save_dir, exist_ok=True)
 
     # Save RNG state

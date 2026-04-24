@@ -6326,6 +6326,11 @@ def sample_images(*args, **kwargs):
     return sample_images_common(StableDiffusionLongPromptWeightingPipeline, *args, **kwargs)
 
 
+def get_sample_output_dir(args: argparse.Namespace) -> str:
+    sample_output_dir = getattr(args, "sample_output_dir", None)
+    return sample_output_dir if sample_output_dir else os.path.join(args.output_dir, "sample")
+
+
 def line_to_prompt_dict(line: str) -> dict:
     # subset of gen_img_diffusers
     prompt_args = line.split(" --")
@@ -6510,7 +6515,7 @@ def sample_images_common(
         clip_skip=args.clip_skip,
     )
     pipeline.to(distributed_state.device)
-    save_dir = args.output_dir + "/sample"
+    save_dir = get_sample_output_dir(args)
     os.makedirs(save_dir, exist_ok=True)
 
     # preprocess prompts
