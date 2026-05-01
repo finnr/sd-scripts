@@ -1215,6 +1215,7 @@ class NetworkTrainer:
 
         # calculate steps to skip when resuming or starting from a specific step
         initial_step = 0
+        initial_step_from_state = False
         if args.initial_epoch is not None or args.initial_step is not None:
             # if initial_epoch or initial_step is specified, steps_from_state is ignored even when resuming
             if steps_from_state is not None:
@@ -1232,12 +1233,16 @@ class NetworkTrainer:
             # if initial_epoch and initial_step are not specified, steps_from_state is used when resuming
             if steps_from_state is not None:
                 initial_step = steps_from_state
+                initial_step_from_state = True
                 steps_from_state = None
 
         if initial_step > 0:
             assert (
                 args.max_train_steps > initial_step
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
+
+        global_step = initial_step
+        resume_step = initial_step
 
         epoch_to_start = 0
         if initial_step > 0:
@@ -1248,16 +1253,16 @@ class NetworkTrainer:
                         f"initial_step is specified but not resuming. lr scheduler will be started from the beginning / initial_stepが指定されていますがresumeしていないため、lr schedulerは最初から始まります"
                     )
                 logger.info(f"skipping {initial_step} steps / {initial_step}ステップをスキップします")
+                steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+                epoch_to_start = initial_step // steps_per_epoch
+                initial_step = initial_step % steps_per_epoch
                 initial_step *= args.gradient_accumulation_steps
 
                 # set epoch to start to make initial_step less than len(train_dataloader)
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
             else:
                 # if not, only epoch no is skipped for informative purpose
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
                 initial_step = 0  # do not skip
-
-        global_step = 0
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1312,12 +1317,13 @@ class NetworkTrainer:
             gc.collect()
             clean_memory_on_device(accelerator.device)
 
-        # For --sample_at_first
-        optimizer_eval_fn()
-        self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-        optimizer_train_fn()
+        # For --sample_at_first. Do not emit epoch-0 samples when resuming from a saved state.
+        if not initial_step_from_state:
+            optimizer_eval_fn()
+            self.sample_images(accelerator, args, 0, 0, accelerator.device, vae, tokenizers, text_encoder, unet)
+            optimizer_train_fn()
         is_tracking = len(accelerator.trackers) > 0
-        if is_tracking:
+        if is_tracking and not initial_step_from_state:
             # log empty object to commit the sample images to wandb
             accelerator.log({}, step=0)
 
@@ -1325,8 +1331,7 @@ class NetworkTrainer:
         if initial_step > 0:  # only if skip_until_initial_step is specified
             for skip_epoch in range(epoch_to_start):  # skip epochs
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
-                initial_step -= len(train_dataloader)
-            global_step = initial_step
+            global_step = resume_step
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
@@ -1340,7 +1345,11 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            total=args.max_train_steps,
+            initial=global_step,
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
 
         validation_steps = (
