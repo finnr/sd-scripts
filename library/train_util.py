@@ -11,12 +11,14 @@ import logging
 import pathlib
 import re
 import shutil
+import string
 import time
 import typing
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
 import glob
 import math
+import ntpath
 import os
 import random
 import hashlib
@@ -98,6 +100,11 @@ DEFAULT_STEP_NAME = "at"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
+INTERMEDIATE_SAVE_NAME_FORMAT_FIELDS = ("model_name", "epoch", "step", "number", "save_type")
+INTERMEDIATE_SAVE_NAME_FORMAT_FIELDS_BY_SAVE_TYPE = {
+    "epoch": ("model_name", "epoch", "number", "save_type"),
+    "step": ("model_name", "step", "number", "save_type"),
+}
 
 # region dataset
 
@@ -3855,6 +3862,15 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--output_name", type=str, default=None, help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名"
     )
     parser.add_argument(
+        "--intermediate_save_name_format",
+        type=str,
+        default=None,
+        help=(
+            "format for intermediate checkpoint and diffusers directory names. Available fields: {model_name}, "
+            "{number}, {save_type}, plus {epoch} for epoch saves or {step} for step saves"
+        ),
+    )
+    parser.add_argument(
         "--huggingface_repo_id",
         type=str,
         default=None,
@@ -5839,14 +5855,91 @@ def default_if_none(value, default):
     return default if value is None else value
 
 
-def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int):
+def validate_intermediate_save_name(name: str):
+    if name == "":
+        raise ValueError("--intermediate_save_name_format produced an empty name")
+    if "/" in name or "\\" in name:
+        raise ValueError("--intermediate_save_name_format must produce a file or directory name, not a path")
+    normalized_name = os.path.normpath(name)
+    if (
+        normalized_name != name
+        or normalized_name in (os.curdir, os.pardir)
+        or os.path.basename(normalized_name) != normalized_name
+        or os.path.splitdrive(normalized_name)[0] != ""
+        or ntpath.splitdrive(normalized_name)[0] != ""
+    ):
+        raise ValueError("--intermediate_save_name_format must produce a plain file or directory name")
+
+
+def validate_intermediate_save_name_format_fields(name_format: str, save_type: str):
+    supported_fields_for_save_type = INTERMEDIATE_SAVE_NAME_FORMAT_FIELDS_BY_SAVE_TYPE.get(save_type)
+    if supported_fields_for_save_type is None:
+        raise ValueError(f"unsupported intermediate save_type: {save_type}")
+
+    try:
+        parsed_format = list(string.Formatter().parse(name_format))
+    except ValueError as e:
+        raise ValueError(f"invalid --intermediate_save_name_format: {e}") from e
+
+    for _, field_name, format_spec, _ in parsed_format:
+        if field_name is not None and field_name not in supported_fields_for_save_type:
+            supported_fields = ", ".join(f"{{{field}}}" for field in supported_fields_for_save_type)
+            raise ValueError(
+                f"invalid --intermediate_save_name_format field {{{field_name}}} for {save_type} save; supported fields: {supported_fields}"
+            )
+        if format_spec:
+            validate_intermediate_save_name_format_fields(format_spec, save_type)
+
+
+def format_intermediate_save_name(
+    args: argparse.Namespace,
+    model_name: str,
+    save_type: str,
+    number: int,
+    epoch: Optional[int] = None,
+    step: Optional[int] = None,
+):
+    name_format = getattr(args, "intermediate_save_name_format", None)
+    if name_format is None:
+        if save_type == "epoch":
+            return EPOCH_FILE_NAME.format(model_name, number)
+        if save_type == "step":
+            return STEP_FILE_NAME.format(model_name, number)
+        raise ValueError(f"unsupported intermediate save_type: {save_type}")
+
+    validate_intermediate_save_name_format_fields(name_format, save_type)
+
+    try:
+        name = name_format.format(
+            model_name=model_name,
+            epoch=epoch,
+            step=step,
+            number=number,
+            save_type=save_type,
+        )
+    except Exception as e:
+        raise ValueError(f"invalid --intermediate_save_name_format: {e}") from e
+
+    validate_intermediate_save_name(name)
+    return name
+
+
+def get_epoch_intermediate_save_name(args: argparse.Namespace, epoch_no: int, step_no: Optional[int] = None):
     model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME)
-    return EPOCH_FILE_NAME.format(model_name, epoch_no) + ext
+    return format_intermediate_save_name(args, model_name, "epoch", epoch_no, epoch=epoch_no, step=step_no)
 
 
-def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int):
+def get_step_intermediate_save_name(args: argparse.Namespace, step_no: int, epoch_no: Optional[int] = None):
     model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME)
-    return STEP_FILE_NAME.format(model_name, step_no) + ext
+    return format_intermediate_save_name(args, model_name, "step", step_no, epoch=epoch_no, step=step_no)
+
+
+def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int, step_no: Optional[int] = None):
+    return get_epoch_intermediate_save_name(args, epoch_no, step_no) + ext
+
+
+def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int, epoch_no: Optional[int] = None):
+    return get_step_intermediate_save_name(args, step_no, epoch_no) + ext
 
 
 def get_last_ckpt_name(args: argparse.Namespace, ext: str):
@@ -5951,9 +6044,9 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         ext = ".safetensors" if use_safetensors else ".ckpt"
 
         if on_epoch_end:
-            ckpt_name = get_epoch_ckpt_name(args, ext, epoch_no)
+            ckpt_name = get_epoch_ckpt_name(args, ext, epoch_no, global_step)
         else:
-            ckpt_name = get_step_ckpt_name(args, ext, global_step)
+            ckpt_name = get_step_ckpt_name(args, ext, global_step, epoch_no)
 
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
         logger.info("")
@@ -5977,9 +6070,10 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
 
     else:
         if on_epoch_end:
-            out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, epoch_no))
+            out_name = get_epoch_intermediate_save_name(args, epoch_no, global_step)
         else:
-            out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, global_step))
+            out_name = get_step_intermediate_save_name(args, global_step, epoch_no)
+        out_dir = os.path.join(args.output_dir, out_name)
 
         logger.info("")
         logger.info(f"saving model: {out_dir}")
@@ -5991,9 +6085,10 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         # remove older checkpoints
         if remove_no is not None:
             if on_epoch_end:
-                remove_out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+                remove_out_name = get_epoch_intermediate_save_name(args, remove_no)
             else:
-                remove_out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+                remove_out_name = get_step_intermediate_save_name(args, remove_no)
+            remove_out_dir = os.path.join(args.output_dir, remove_out_name)
 
             if os.path.exists(remove_out_dir):
                 logger.info(f"removing old model: {remove_out_dir}")
